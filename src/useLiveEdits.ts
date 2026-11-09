@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { saveEdits } from './archive'
-import { endpoint, hour, makeDemoEdit, minute, readEdit, type Edit } from './edits'
+import { endpoint, hour, initialHistory, makeDemoEdit, minute, readEdit, sourceOf, topicKey, type Edit, type Source } from './edits'
+import { watchRecentChanges, type Health } from './recentChanges'
 
 export const slots = [
   [0, 24, 11], [1, 72, 17], [0, 72, 41], [1, 24, 49],
@@ -15,6 +16,7 @@ const emptySnapshot = (): Snapshot => ({ edits: [], recent: [], bubbles: [], now
 export function useLiveEdits(demo: boolean, language: string) {
   const [snapshot, setSnapshot] = useState(emptySnapshot)
   const [status, setStatus] = useState('연결 중')
+  const [health, setHealth] = useState<Partial<Record<Source, Health>>>({})
   const [archiveVersion, setArchiveVersion] = useState(0)
   const languageRef = useRef(language)
   const resetBubbles = useRef<() => void>(() => {})
@@ -26,7 +28,7 @@ export function useLiveEdits(demo: boolean, language: string) {
 
   useEffect(() => {
     let edits: Edit[] = []
-    let recent: Edit[] = []
+    const recent = new Map<Source, Edit[]>()
     let pending: Edit[] = []
     const bubbles = new Map<string, Bubble>()
     const seen = new Map<string, number>()
@@ -35,19 +37,28 @@ export function useLiveEdits(demo: boolean, language: string) {
     let live = true
     let stream: EventSource | undefined
     let demoTimer: ReturnType<typeof setInterval> | undefined
+    let stopRecentChanges: (() => void) | undefined
+    const openedAt = Math.floor(Date.now() / 1000) * 1000
+    const historyStart = openedAt - initialHistory
+    let caughtUp = false
 
     function publish() {
       const now = Date.now()
       edits = edits.filter(edit => edit.at > now - hour)
-      for (const [id, at] of seen) if (at <= now - minute) seen.delete(id)
+      for (const [source, rows] of recent) {
+        recent.set(source, rows.sort((a, b) => b.at - a.at).slice(0, 200))
+      }
+      for (const [id, at] of seen) if (at <= now - hour) seen.delete(id)
       for (const [key, bubble] of bubbles) if (bubble.updated + lifetime <= now) bubbles.delete(key)
-      setSnapshot({ edits, recent, bubbles: [...bubbles.values()], now })
+      const feed = [...recent.values()].flat().sort((a, b) => b.at - a.at)
+      setSnapshot({ edits: edits.slice(), recent: feed, bubbles: [...bubbles.values()], now })
     }
 
     function addBubble(edit: Edit, now: number) {
-      const existing = bubbles.get(edit.key)
+      const key = topicKey(edit)
+      const existing = bubbles.get(key)
       if (existing) {
-        bubbles.set(edit.key, { ...existing, updated: now })
+        bubbles.set(key, { ...existing, edit, updated: now })
         return
       }
       if (now - lastBubble < 650) return
@@ -55,20 +66,24 @@ export function useLiveEdits(demo: boolean, language: string) {
       for (let offset = 0; offset < slots.length; offset++) {
         const slot = (nextSlot + offset) % slots.length
         if (occupied.has(slot)) continue
-        bubbles.set(edit.key, { edit, slot, updated: now })
+        bubbles.set(key, { edit, slot, updated: now })
         nextSlot = (slot + 1) % slots.length
         lastBubble = now
         return
       }
     }
 
-    function addEdit(edit: Edit | null) {
+    function addEdit(edit: Edit | null, historical = false) {
       if (!edit) return
       const now = Date.now()
       if (edit.id && seen.has(edit.id)) return
       if (edit.id) seen.set(edit.id, now)
       edits.push(edit)
-      recent = [edit, ...recent.slice(0, 199)]
+      const source = sourceOf(edit.url)
+      const rows = recent.get(source) ?? []
+      rows.push(edit)
+      recent.set(source, rows)
+      if (historical) return
       if (!demo && edit.id) pending.push(edit)
       if (languageRef.current === 'all' || languageRef.current === edit.language) addBubble(edit, now)
     }
@@ -94,6 +109,13 @@ export function useLiveEdits(demo: boolean, language: string) {
       publish()
     }
 
+    setHealth({})
+    if (!demo) {
+      stopRecentChanges = watchRecentChanges(historyStart,
+        edit => addEdit(edit, edit.at < openedAt),
+        (source, next) => setHealth(previous => ({ ...previous, [source]: next })),
+      )
+    }
     if (demo) {
       setStatus('데모 · 예시 데이터')
       let index = 0
@@ -104,13 +126,25 @@ export function useLiveEdits(demo: boolean, language: string) {
       setStatus('이 브라우저는 실시간 연결을 지원하지 않아요.')
     } else {
       setStatus('연결 중')
-      stream = new EventSource(endpoint)
-      stream.onopen = () => { if (live) setStatus('실시간 연결') }
+      const url = new URL(endpoint)
+      url.searchParams.set('since', new Date(historyStart).toISOString())
+      stream = new EventSource(url)
+      stream.onopen = () => {
+        if (live) setStatus(caughtUp ? '실시간 연결' : '접속 전 10분 기록 불러오는 중')
+      }
       stream.onerror = () => { if (live) setStatus('연결이 끊겼어요 · 다시 연결 중') }
       stream.onmessage = (event) => {
         if (!live) return
         try {
-          addEdit(readEdit(JSON.parse(event.data), Date.now()))
+          const now = Date.now()
+          const edit = readEdit(JSON.parse(event.data), now, Math.max(historyStart, now - hour))
+          if (!edit || sourceOf(edit.url) !== 'wikipedia') return
+          const historical = edit.at < openedAt
+          if (!historical && !caughtUp) {
+            caughtUp = true
+            setStatus('실시간 연결')
+          }
+          addEdit(edit, historical)
         } catch {
           // A malformed event should not stop the stream.
         }
@@ -126,6 +160,7 @@ export function useLiveEdits(demo: boolean, language: string) {
       live = false
       resetBubbles.current = () => {}
       stream?.close()
+      stopRecentChanges?.()
       clearInterval(demoTimer)
       clearInterval(renderTimer)
       clearInterval(archiveTimer)
@@ -135,5 +170,5 @@ export function useLiveEdits(demo: boolean, language: string) {
     }
   }, [demo])
 
-  return { ...snapshot, status, archiveVersion }
+  return { ...snapshot, status, health, archiveVersion }
 }

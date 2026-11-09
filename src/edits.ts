@@ -1,8 +1,25 @@
 export const endpoint = 'https://stream.wikimedia.org/v2/stream/recentchange'
 export const minute = 60_000
 export const hour = 60 * minute
+export const initialHistory = 10 * minute
 export const hourStart = (time: number) => Math.floor(time / hour) * hour
 export const names: Record<string, string> = { ko: '한국어', en: '영어', ja: '일본어' }
+
+export const sourceNames = {
+  wikipedia: '위키백과',
+  wiktionary: '위키낱말사전',
+  commons: '위키미디어 공용',
+} as const
+export type Source = keyof typeof sourceNames
+
+export function sourceOf(url: string): Source {
+  if (url.startsWith('https://commons.wikimedia.org/')) return 'commons'
+  return /^https:\/\/[^/]+\.wiktionary\.org\//.test(url) ? 'wiktionary' : 'wikipedia'
+}
+
+export function languageLabel(language: string) {
+  return language === 'mul' ? '다국어' : names[language] ?? language.toUpperCase()
+}
 
 export type Edit = {
   id: string | null
@@ -30,19 +47,22 @@ type Change = {
   length?: { new?: number; old?: number }
 }
 
-export function readEdit(data: Change | null, now: number): Edit | null {
-  if (!data || data.bot !== false || data.namespace !== 0 ||
+export function readEdit(data: Change | null, now: number, after = now - minute): Edit | null {
+  if (!data || data.bot !== false ||
       (data.type !== 'edit' && data.type !== 'new') ||
       typeof data.title !== 'string' || !data.title.trim()) return null
 
-  const site = typeof data.server_name === 'string' &&
-    /^([a-z][a-z0-9-]*)\.wikipedia\.org$/.exec(data.server_name)
-  if (!site || ['www', 'test', 'test2'].includes(site[1])) return null
+  const host = data.server_name
+  if (typeof host !== 'string') return null
+  const commons = host === 'commons.wikimedia.org'
+  const site = /^([a-z][a-z0-9-]*)\.(wikipedia|wiktionary)\.org$/.exec(host)
+  if (commons ? ![0, 6, 14].includes(data.namespace ?? -1) :
+      !site || ['www', 'test', 'test2'].includes(site[1]) || data.namespace !== 0) return null
   const at = Number(data.timestamp) * 1000
-  if (!Number.isFinite(at) || at <= now - minute || at > now + 10_000) return null
+  if (!Number.isFinite(at) || at <= after || at > now + 10_000) return null
 
-  const language = site[1]
-  const origin = 'https://' + site[0]
+  const language = commons ? 'mul' : site![1]
+  const origin = 'https://' + host
   const title = data.title
   const revision = data.revision?.new
   const previous = data.revision?.old
@@ -65,32 +85,59 @@ export function readEdit(data: Change | null, now: number): Edit | null {
     id: data.meta?.id || (data.id != null ? language + ':' + data.id : null),
     link, delta, at, title, language,
     note: typeof data.comment === 'string' ? data.comment.trim() : '',
-    key: site[0] + '/' + title,
+    key: host + '/' + title,
     url: origin + '/wiki/' + encodeURIComponent(title.replaceAll(' ', '_')),
   }
 }
 
-export const demoEdits = [
-  ['ko', '한강'], ['en', 'Jazz'], ['ja', '月'], ['ko', '한강'],
-  ['en', 'Red panda'], ['ko', '서울특별시'], ['ja', '富士山'], ['en', 'Jazz'],
-]
+const demoEdits = [
+  ['en.wikipedia.org', 'Jazz', 0],
+  ['en.wiktionary.org', 'jazz', 0],
+  ['commons.wikimedia.org', 'Category:Jazz', 14],
+  ['ko.wikipedia.org', '한강', 0],
+  ['ko.wiktionary.org', '한강', 0],
+  ['ja.wikipedia.org', '月', 0],
+  ['commons.wikimedia.org', 'Category:Seoul', 14],
+] as const
 
 export function makeDemoEdit(index: number, now: number) {
-  const [language, title] = demoEdits[index % demoEdits.length]
+  const [host, title, namespace] = demoEdits[index % demoEdits.length]
   return readEdit({
-    title, server_name: language + '.wikipedia.org', bot: false,
-    namespace: 0, type: 'edit', comment: '예시 편집 · 본문 표현 정리',
+    title, server_name: host, bot: false,
+    namespace, type: 'edit', comment: '예시 편집 · 본문 표현 정리',
     length: { old: 2500, new: 2518 }, timestamp: Math.floor(now / 1000),
   }, now)
 }
 
-export function countTitles(edits: Edit[]) {
-  const counts = new Map<string, { edit: Edit; count: number }>()
-  let top: { edit: Edit; count: number } | undefined
-  for (const edit of edits) {
-    const entry = counts.get(edit.key) ?? { edit, count: 0 }
-    entry.count++
-    counts.set(edit.key, entry)
+type TopicItem = Pick<Edit, 'title' | 'url' | 'language'>
+type TopicLink = { item: TopicItem; count: number }
+export type Topic = { key: string; title: string; count: number; links: Map<string, TopicLink> }
+
+function keywordTitle(item: TopicItem) {
+  if (sourceOf(item.url) !== 'commons') return item.title
+  if (item.title.startsWith('File:')) return item.title.slice(5).replace(/\.[a-z0-9]{2,5}$/i, '')
+  return item.title.replace(/^Category:/, '')
+}
+
+export function topicKey(item: TopicItem) {
+  return keywordTitle(item).normalize('NFKC').replace(/[_\s]+/g, ' ').trim().toLowerCase()
+}
+
+export function countTitles<T extends TopicItem>(edits: T[], weight: (item: T) => number = () => 1) {
+  const counts = new Map<string, Topic>()
+  let top: Topic | undefined
+  for (const item of edits) {
+    const key = topicKey(item)
+    const value = weight(item)
+    let entry = counts.get(key)
+    if (!entry) {
+      entry = { key, title: keywordTitle(item), count: 0, links: new Map() }
+      counts.set(key, entry)
+    }
+    entry.count += value
+    const link = entry.links.get(item.url)
+    if (link) link.count += value
+    else entry.links.set(item.url, { item, count: value })
     if (!top || entry.count > top.count) top = entry
   }
   return { counts, top }
