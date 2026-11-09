@@ -1,0 +1,2 @@
+:root{color-scheme:dark;--bg:#0b101c;--surface:#111827;--line:#29354a;--text:#eef4fb;--muted:#a0adc3;--mint:#82f4cf}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 60% 0,#192745 0,transparent 52%),var(--bg);color:var(--text);font:15px/1.55 system-ui,sans-serif}
