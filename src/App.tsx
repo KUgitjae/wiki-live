@@ -6,7 +6,11 @@ import './App.css'
 
 const languages = [['all', '전체'], ...Object.entries(names)]
 const sources = Object.keys(sourceNames) as Source[]
-const periods = [[1, '1분'], [10, '10분'], [60, '1시간']] as const
+const periods = [
+  { minutes: 1, label: '1분', bubbleLifetime: 5_000 },
+  { minutes: 10, label: '10분', bubbleLifetime: 10_000 },
+  { minutes: 60, label: '1시간', bubbleLifetime: 20_000 },
+] as const
 const timeFormat = new Intl.DateTimeFormat('ko-KR', {
   timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 })
@@ -38,22 +42,23 @@ function TopicLinks({ topic }: { topic: Topic }) {
 
 export default function App() {
   const [language, setLanguage] = useState('all')
-  const [period, setPeriod] = useState<number>(10)
+  const [period, setPeriod] = useState<(typeof periods)[number]>(periods[1])
   const [demo, setDemo] = useState(false)
   const [feedSource, setFeedSource] = useState<Source | 'all'>('all')
   const [selectedHour, setSelectedHour] = useState<number | null>(null)
   const [archive, setArchive] = useState<{ key: number; records: Keyword[] | null }>()
-  const { edits, recent, bubbles, now, status, health, archiveVersion } = useLiveEdits(demo, language)
+  const { edits, recent, bubbles, now, status, health, archiveVersion } = useLiveEdits(demo, language, period.bubbleLifetime)
 
   const currentHour = hourStart(now)
+  const windowStart = now - period.minutes * minute
   const hourSlots = useMemo(() => Array.from({ length: 24 }, (_, i) => currentHour - i * hour), [currentHour])
   const archiveHour = selectedHour !== null && hourSlots.includes(selectedHour) ? selectedHour : currentHour
   const stats = useMemo(() => {
     const filtered = edits.filter(edit =>
-      edit.at > now - period * minute && (language === 'all' || edit.language === language))
+      edit.at > windowStart && edit.at <= now && (language === 'all' || edit.language === language))
     return { ...countTitles(filtered), total: filtered.length }
-  }, [edits, now, period, language])
-  const periodLabel = '최근 ' + periods.find(([value]) => value === period)?.[1]
+  }, [edits, now, windowStart, language])
+  const periodLabel = '최근 ' + period.label
   const normalStatus = status === '실시간 연결' || status === '연결 중' || status.startsWith('접속 전')
   const visibleEdits = recent.filter(edit => language === 'all' || edit.language === language)
   const feed = feedSource === 'all'
@@ -82,13 +87,13 @@ export default function App() {
     return <div className="field" aria-label="최근 편집 말풍선">
       {bubbles.map(({ edit, slot, updated }) => {
         const [side, x, y] = slots[slot]
-        if (side !== field) return null
+        if (side !== field || updated + period.bubbleLifetime <= now || edit.at <= windowStart || edit.at > now) return null
         const count = stats.counts.get(topicKey(edit))?.count ?? 0
         return <a
           key={edit.key + ':' + updated}
           href={edit.url} target="_blank" rel="noopener noreferrer"
           className={'bubble ' + edit.language} title={edit.title}
-          style={{ '--x': x + '%', '--y': y + '%' } as CSSProperties}
+          style={{ '--x': x + '%', '--y': y + '%', '--lifetime': `${period.bubbleLifetime}ms` } as CSSProperties}
         >
           <span className="lang">{edit.language === 'mul' ? '공용' : edit.language.toUpperCase()}</span>
           <span className="bubble-title">{edit.title}</span>
@@ -117,9 +122,9 @@ export default function App() {
       <div className="bar" role="group" aria-label="실시간 집계 범위">
         <span className="metric">집계 범위</span>
         <div className="periods">
-          {periods.map(([value, label]) => <button
-            key={value} type="button" aria-pressed={period === value} onClick={() => setPeriod(value)}
-          >{label}</button>)}
+          {periods.map(option => <button
+            key={option.minutes} type="button" aria-pressed={period === option} onClick={() => setPeriod(option)}
+          >{option.label}</button>)}
         </div>
       </div>
       <div className="bar">
@@ -141,7 +146,7 @@ export default function App() {
           {stats.top ? <>
             <small>합계 {stats.top.count.toLocaleString('ko-KR')}회 편집 · 링크를 누르면 해당 사이트로 이동해요.</small>
             <TopicLinks topic={stats.top} />
-          </> : <small>접속 직전 10분부터 받은 편집을 집계해요.</small>}
+          </> : <small>현재 시각을 기준으로 선택한 기간의 편집을 집계해요.</small>}
         </div>
         {bubbleField(1)}
       </div>

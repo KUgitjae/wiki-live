@@ -1,30 +1,33 @@
 import { useEffect, useRef, useState } from 'react'
 import { saveEdits } from './archive'
-import { endpoint, hour, initialHistory, makeDemoEdit, minute, readEdit, sourceOf, topicKey, type Edit, type Source } from './edits'
+import { endpoint, hour, makeDemoEdit, minute, readEdit, sourceOf, topicKey, type Edit, type Source } from './edits'
 import { watchRecentChanges, type Health } from './recentChanges'
 
 export const slots = [
-  [0, 24, 11], [1, 72, 17], [0, 72, 41], [1, 24, 49],
-  [0, 31, 72], [1, 70, 76], [0, 75, 10], [1, 24, 12],
+  [0, 25, 12], [1, 75, 34], [0, 75, 12], [1, 25, 34], [0, 50, 57],
 ] as const
 
-const lifetime = 8_000
 type Bubble = { edit: Edit; slot: number; updated: number }
 type Snapshot = { edits: Edit[]; recent: Edit[]; bubbles: Bubble[]; now: number }
 const emptySnapshot = (): Snapshot => ({ edits: [], recent: [], bubbles: [], now: Date.now() })
 
-export function useLiveEdits(demo: boolean, language: string) {
+export function useLiveEdits(demo: boolean, language: string, bubbleLifetime: number) {
   const [snapshot, setSnapshot] = useState(emptySnapshot)
   const [status, setStatus] = useState('연결 중')
   const [health, setHealth] = useState<Partial<Record<Source, Health>>>({})
   const [archiveVersion, setArchiveVersion] = useState(0)
   const languageRef = useRef(language)
+  const lifetimeRef = useRef(bubbleLifetime)
   const resetBubbles = useRef<() => void>(() => {})
 
   useEffect(() => {
     languageRef.current = language
     resetBubbles.current()
   }, [language])
+
+  useEffect(() => {
+    lifetimeRef.current = bubbleLifetime
+  }, [bubbleLifetime])
 
   useEffect(() => {
     let edits: Edit[] = []
@@ -39,8 +42,14 @@ export function useLiveEdits(demo: boolean, language: string) {
     let demoTimer: ReturnType<typeof setInterval> | undefined
     let stopRecentChanges: (() => void) | undefined
     const openedAt = Math.floor(Date.now() / 1000) * 1000
-    const historyStart = openedAt - initialHistory
+    const historyStart = openedAt - hour
     let caughtUp = false
+
+    function expireBubbles(now: number) {
+      for (const [key, bubble] of bubbles) {
+        if (bubble.updated + lifetimeRef.current <= now) bubbles.delete(key)
+      }
+    }
 
     function publish() {
       const now = Date.now()
@@ -49,12 +58,13 @@ export function useLiveEdits(demo: boolean, language: string) {
         recent.set(source, rows.sort((a, b) => b.at - a.at).slice(0, 200))
       }
       for (const [id, at] of seen) if (at <= now - hour) seen.delete(id)
-      for (const [key, bubble] of bubbles) if (bubble.updated + lifetime <= now) bubbles.delete(key)
+      expireBubbles(now)
       const feed = [...recent.values()].flat().sort((a, b) => b.at - a.at)
       setSnapshot({ edits: edits.slice(), recent: feed, bubbles: [...bubbles.values()], now })
     }
 
     function addBubble(edit: Edit, now: number) {
+      expireBubbles(now)
       const key = topicKey(edit)
       const existing = bubbles.get(key)
       if (existing) {
@@ -130,7 +140,7 @@ export function useLiveEdits(demo: boolean, language: string) {
       url.searchParams.set('since', new Date(historyStart).toISOString())
       stream = new EventSource(url)
       stream.onopen = () => {
-        if (live) setStatus(caughtUp ? '실시간 연결' : '접속 전 10분 기록 불러오는 중')
+        if (live) setStatus(caughtUp ? '실시간 연결' : '접속 전 1시간 기록 불러오는 중')
       }
       stream.onerror = () => { if (live) setStatus('연결이 끊겼어요 · 다시 연결 중') }
       stream.onmessage = (event) => {

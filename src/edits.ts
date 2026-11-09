@@ -1,7 +1,6 @@
 export const endpoint = 'https://stream.wikimedia.org/v2/stream/recentchange'
 export const minute = 60_000
 export const hour = 60 * minute
-export const initialHistory = 10 * minute
 export const hourStart = (time: number) => Math.floor(time / hour) * hour
 export const names: Record<string, string> = { ko: '한국어', en: '영어', ja: '일본어' }
 
@@ -98,6 +97,7 @@ const demoEdits = [
   ['ko.wiktionary.org', '한강', 0],
   ['ja.wikipedia.org', '月', 0],
   ['commons.wikimedia.org', 'Category:Seoul', 14],
+  ['ko.wikipedia.org', '인공지능', 0],
 ] as const
 
 export function makeDemoEdit(index: number, now: number) {
